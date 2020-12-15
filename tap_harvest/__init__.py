@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import time
 
 import backoff
 import requests
@@ -165,6 +166,7 @@ def get_company():
 
 def sync_endpoint(schema_name, endpoint=None, path=None, date_fields=None, with_updated_since=True, #pylint: disable=too-many-arguments
                   for_each_handler=None, map_handler=None, object_to_id=None):
+    full_replication = CONFIG.get("full_replication", False)
     schema = load_schema(schema_name)
     bookmark_property = 'updated_at'
 
@@ -176,6 +178,9 @@ def sync_endpoint(schema_name, endpoint=None, path=None, date_fields=None, with_
     start = get_start(schema_name)
     start_dt = pendulum.parse(start)
     updated_since = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    stream_version = 1
+    if full_replication:
+        stream_version = int(time.time())
 
     with Transformer() as transformer:
         page = 1
@@ -206,9 +211,12 @@ def sync_endpoint(schema_name, endpoint=None, path=None, date_fields=None, with_
                 append_times_to_dates(item, date_fields)
 
                 if item[bookmark_property] >= start:
-                    singer.write_record(schema_name,
-                                        item,
-                                        time_extracted=time_extracted)
+                    new_record = singer.RecordMessage(
+                        stream=schema_name,
+                        record=item,
+                        version=stream_version,
+                        time_extracted=time_extracted)
+                    singer.write_message(new_record)
 
                     # take any additional actions required for the currently loaded endpoint
                     if for_each_handler is not None:
@@ -218,6 +226,8 @@ def sync_endpoint(schema_name, endpoint=None, path=None, date_fields=None, with_
             page = response['next_page']
 
     singer.write_state(STATE)
+    if full_replication:
+        singer.write_version(schema_name, stream_version)
 
 
 def sync_time_entries():
