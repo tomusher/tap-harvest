@@ -2,6 +2,7 @@
 
 import os
 import time
+from datetime import datetime
 
 import backoff
 import requests
@@ -25,6 +26,11 @@ BASE_ID_URL = "https://id.getharvest.com/api/v2/"
 CONFIG = {}
 STATE = {}
 AUTH = {}
+
+ALL_STREAMS = ['clients', 'contacts', 'projects', 'tasks', 'project_tasks', 'project_users', 'expense_categories',
+               'invoice_item_categories', 'estimate_item_categories', 'user_roles', 'external_reference', 'time_entry_external_reference',
+               'time_entries', 'invoice_messages', 'invoice_payments', 'invoice_line_items', 'invoices', 'estimate_line_items', 'estimates',
+               'user_projects', 'user_project_tasks', 'users', 'expenses']
 
 
 class Auth:
@@ -164,8 +170,15 @@ def get_company():
     return request(url)
 
 
+def get_stream_version():
+    full_replication = CONFIG.get("full_replication", False)
+    if full_replication:
+        return int(datetime.now().timestamp())
+
+    return 1
+
 def sync_endpoint(schema_name, endpoint=None, path=None, date_fields=None, with_updated_since=True, #pylint: disable=too-many-arguments
-                  for_each_handler=None, map_handler=None, object_to_id=None):
+                  for_each_handler=None, map_handler=None, object_to_id=None, stream_version=None):
     full_replication = CONFIG.get("full_replication", False)
     schema = load_schema(schema_name)
     bookmark_property = 'updated_at'
@@ -178,9 +191,6 @@ def sync_endpoint(schema_name, endpoint=None, path=None, date_fields=None, with_
     start = get_start(schema_name)
     start_dt = pendulum.parse(start)
     updated_since = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    stream_version = 1
-    if full_replication:
-        stream_version = int(time.time())
 
     with Transformer() as transformer:
         page = 1
@@ -226,11 +236,9 @@ def sync_endpoint(schema_name, endpoint=None, path=None, date_fields=None, with_
             page = response['next_page']
 
     singer.write_state(STATE)
-    if full_replication:
-        singer.write_version(schema_name, stream_version)
 
 
-def sync_time_entries():
+def sync_time_entries(stream_version=None):
     def for_each_time_entry(time_entry, time_extracted):
         # Extract external_reference
         external_reference_schema = load_and_write_schema("external_reference")
@@ -242,9 +250,12 @@ def sync_time_entries():
                 external_reference = transformer.transform(external_reference,
                                                            external_reference_schema)
 
-                singer.write_record("external_reference",
-                                    external_reference,
-                                    time_extracted=time_extracted)
+                new_record = singer.RecordMessage(
+                    stream="external_reference",
+                    record=external_reference,
+                    version=stream_version,
+                    time_extracted=time_extracted)
+                singer.write_message(new_record)
 
                 # Create pivot row for time_entry and external_reference
                 pivot_row = {
@@ -252,9 +263,12 @@ def sync_time_entries():
                     'external_reference_id': external_reference['id']
                 }
 
-                singer.write_record("time_entry_external_reference",
-                                    pivot_row,
-                                    time_extracted=time_extracted)
+                new_record = singer.RecordMessage(
+                    stream="time_entry_external_reference",
+                    record=pivot_row,
+                    version=stream_version,
+                    time_extracted=time_extracted)
+                singer.write_message(new_record)
 
     sync_endpoint("time_entries", for_each_handler=for_each_time_entry,
                   object_to_id=[
@@ -266,10 +280,10 @@ def sync_time_entries():
                       'task_assignment',
                       'external_reference',
                       'invoice'
-                  ])
+                  ], stream_version=stream_version)
 
 
-def sync_invoices():
+def sync_invoices(stream_version=None):
     def for_each_invoice(invoice, time_extracted):
         def map_invoice_message(message):
             message['invoice_id'] = invoice['id']
@@ -286,7 +300,8 @@ def sync_invoices():
                       endpoint=("invoices/{}/messages".format(invoice['id'])),
                       path="invoice_messages",
                       with_updated_since=False,
-                      map_handler=map_invoice_message)
+                      map_handler=map_invoice_message,
+                      stream_version=stream_version)
 
         # Sync invoice payments
         sync_endpoint("invoice_payments",
@@ -294,7 +309,8 @@ def sync_invoices():
                       path="invoice_payments",
                       with_updated_since=False,
                       map_handler=map_invoice_payment,
-                      date_fields=["send_reminder_on"])
+                      date_fields=["send_reminder_on"],
+                      stream_version=stream_version)
 
         # Extract all invoice_line_items
         line_items_schema = load_and_write_schema("invoice_line_items")
@@ -307,15 +323,19 @@ def sync_invoices():
                     line_item['project_id'] = None
                 line_item = transformer.transform(line_item, line_items_schema)
 
-                singer.write_record("invoice_line_items",
-                                    line_item,
-                                    time_extracted=time_extracted)
+                new_record = singer.RecordMessage(
+                    stream="invoice_line_items",
+                    record=line_item,
+                    version=stream_version,
+                    time_extracted=time_extracted)
+                singer.write_message(new_record)
 
     sync_endpoint("invoices", for_each_handler=for_each_invoice,
-                  object_to_id=['client', 'estimate', 'retainer', 'creator'])
+                  object_to_id=['client', 'estimate', 'retainer', 'creator'],
+                  stream_version=stream_version)
 
 
-def sync_estimates():
+def sync_estimates(stream_version=None):
     def map_estimate_message(message):
         message['estimate_id'] = message['id']
         return message
@@ -327,7 +347,8 @@ def sync_estimates():
                       path="estimate_messages",
                       with_updated_since=False,
                       date_fields=["send_reminder_on"],
-                      map_handler=map_estimate_message)
+                      map_handler=map_estimate_message,
+                      stream_version=stream_version)
 
         # Extract all estimate_line_items
         line_items_schema = load_and_write_schema("estimate_line_items")
@@ -336,17 +357,22 @@ def sync_estimates():
                 line_item['estimate_id'] = estimate['id']
                 line_item = transformer.transform(line_item, line_items_schema)
 
-                singer.write_record("estimate_line_items",
-                                    line_item,
-                                    time_extracted=time_extracted)
+                new_record = singer.RecordMessage(
+                    stream="estimate_line_items",
+                    record=line_item,
+                    version=stream_version,
+                    time_extracted=time_extracted)
+                singer.write_message(new_record)
+
 
     sync_endpoint("estimates",
                   for_each_handler=for_each_estimate,
                   date_fields=["issue_date"],
-                  object_to_id=['client', 'creator'])
+                  object_to_id=['client', 'creator'],
+                  stream_version=stream_version)
 
 
-def sync_roles():
+def sync_roles(stream_version=None):
     def for_each_role(role, time_extracted):
         # Extract user_roles
         load_and_write_schema("user_roles", key_properties=["user_id", "role_id"])
@@ -356,14 +382,17 @@ def sync_roles():
                 'user_id': user_id
             }
 
-            singer.write_record("user_roles",
-                                pivot_row,
-                                time_extracted=time_extracted)
+            new_record = singer.RecordMessage(
+                stream="user_roles",
+                record=pivot_row,
+                version=stream_version,
+                time_extracted=time_extracted)
+            singer.write_message(new_record)
 
-    sync_endpoint("roles", for_each_handler=for_each_role)
+    sync_endpoint("roles", for_each_handler=for_each_role, stream_version=stream_version)
 
 
-def sync_users():
+def sync_users(stream_version=None):
     def for_each_user(user, time_extracted): #pylint: disable=unused-argument
         def map_user_projects(project_assignment):
             project_assignment['user'] = user
@@ -379,9 +408,12 @@ def sync_users():
                     'project_task_id': project_task['id']
                 }
 
-                singer.write_record("user_project_tasks",
-                                    pivot_row,
-                                    time_extracted=time_extracted)
+                new_record = singer.RecordMessage(
+                    stream="user_project_tasks",
+                    record=pivot_row,
+                    version=stream_version,
+                    time_extracted=time_extracted)
+                singer.write_message(new_record)
 
         sync_endpoint("user_projects",
                       endpoint=("users/{}/project_assignments".format(user['id'])),
@@ -389,12 +421,13 @@ def sync_users():
                       with_updated_since=False,
                       object_to_id=['project', 'client', 'user'],
                       map_handler=map_user_projects,
-                      for_each_handler=for_each_user_project)
+                      for_each_handler=for_each_user_project,
+                      stream_version=stream_version)
 
-    sync_endpoint("users", for_each_handler=for_each_user)
+    sync_endpoint("users", for_each_handler=for_each_user, stream_version=stream_version)
 
 
-def sync_expenses():
+def sync_expenses(stream_version=None):
     def map_expense(expense):
         if expense['receipt'] is None:
             expense['receipt_url'] = None
@@ -417,54 +450,62 @@ def sync_expenses():
                       'user',
                       'user_assignment',
                       'invoice'
-                  ])
+                  ],
+                  stream_version=stream_version)
 
 
 def do_sync():
     LOGGER.info("Starting sync")
 
+    stream_version = get_stream_version()
+    full_replication = CONFIG.get("full_replication", False)
+
     company = get_company()
 
     # Grab all clients and client contacts. Contacts have client FKs so grab
     # them last.
-    sync_endpoint("clients")
-    sync_endpoint("contacts", object_to_id=['client'])
-    sync_roles()
+    sync_endpoint("clients", stream_version=stream_version)
+    sync_endpoint("contacts", object_to_id=['client'], stream_version=stream_version)
+    sync_roles(stream_version=stream_version)
 
     # Sync related project objects
-    sync_endpoint("projects", object_to_id=['client'])
-    sync_endpoint("tasks")
+    sync_endpoint("projects", object_to_id=['client'], stream_version=stream_version)
+    sync_endpoint("tasks", stream_version=stream_version)
     sync_endpoint("project_tasks", endpoint='task_assignments', path='task_assignments',
-                  object_to_id=['project', 'task'])
+                  object_to_id=['project', 'task'], stream_version=stream_version)
     sync_endpoint("project_users", endpoint='user_assignments', path='user_assignments',
-                  object_to_id=['project', 'user'])
+                  object_to_id=['project', 'user'], stream_version=stream_version)
 
     # Sync users
-    sync_users()
+    sync_users(stream_version=stream_version)
 
     if company['expense_feature']:
         # Sync expenses and their categories
-        sync_endpoint("expense_categories")
-        sync_expenses()
+        sync_endpoint("expense_categories", stream_version=stream_version)
+        sync_expenses(stream_version=stream_version)
     else:
         LOGGER.info("Expense Feature not enabled, skipping.")
 
     if company['invoice_feature']:
         # Sync invoices and all related records
-        sync_endpoint("invoice_item_categories")
-        sync_invoices()
+        sync_endpoint("invoice_item_categories", stream_version=stream_version)
+        sync_invoices(stream_version=stream_version)
     else:
         LOGGER.info("Invoice Feature not enabled, skipping.")
 
     if company['estimate_feature']:
         # Sync estimates and all related records
-        sync_endpoint("estimate_item_categories")
-        sync_estimates()
+        sync_endpoint("estimate_item_categories", stream_version=stream_version)
+        sync_estimates(stream_version=stream_version)
     else:
         LOGGER.info("Estimate Feature not enabled, skipping.")
 
     # Sync Time Entries along with their external reference objects
-    sync_time_entries()
+    sync_time_entries(stream_version=stream_version)
+    
+    if full_replication:
+        for stream in ALL_STREAMS:
+            singer.write_version(stream, stream_version)
 
     LOGGER.info("Sync complete")
 
